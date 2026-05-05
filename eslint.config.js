@@ -26,6 +26,12 @@ export default [
       },
     },
     plugins: { import: importPlugin },
+    settings: {
+      'import/resolver': {
+        typescript: { project: './tsconfig.eslint.json' },
+        node: true,
+      },
+    },
     rules: {
       'no-unused-vars': 'off',
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
@@ -41,17 +47,7 @@ export default [
       'brace-style': ['error', '1tbs', { allowSingleLine: true }],
       semi: ['error', 'always'],
       quotes: ['error', 'single', { avoidEscape: true, allowTemplateLiterals: true }],
-      'import/extensions': [
-        'error',
-        'always',
-        {
-          js: 'always',
-          ts: 'never',
-          tsx: 'never',
-          json: 'always',
-          ignorePackages: true,
-        },
-      ],
+      'import/extensions': 'off',
       'import/no-unresolved': [
         'error',
         {
