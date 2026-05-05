@@ -1,0 +1,125 @@
+# CI and npm publish workflow.
+#
+# Triggers:
+#   - push / pull_request on `dev` and `main`  → runs the `ci` job (lint, test, build, pack).
+#   - push to `main` or manual workflow_dispatch → additionally runs the `publish` job.
+#
+# Pipeline:
+#   ci      — installs deps, lints, tests, builds, runs `npm pack`, and uploads the
+#             resulting tarball as the `npm-tarball` artifact.
+#   publish — downloads that exact tarball, extracts name/version from its
+#             package.json, verifies the version is not already on npm, then
+#             publishes via `npm publish --provenance`.
+#
+# Build-once / publish-the-artifact: the publish job never rebuilds — it ships
+# the bytes that CI tested. Reproducible and tamper-evident.
+#
+# Authentication: npm Trusted Publisher (OIDC). No NPM_TOKEN secret is used;
+# `id-token: write` lets the npm CLI exchange the GitHub OIDC token at publish
+# time. Requires a matching trusted-publisher config on npmjs.com (org/repo,
+# workflow filename = `ci.yml`). npm CLI ≥ 11.5.1 is required, which is why the
+# publish job uses Node 24 (CI stays on 22 to match runtime support targets).
+#
+# Safeguards:
+#   - Pre-publish guard fails fast if the version already exists on npm.
+#   - Concurrency group `publish-<ref>` serializes publishes per branch and
+#     never cancels an in-flight run.
+#   - `--provenance` attaches a Sigstore attestation tying the artifact to this
+#     workflow run.
+
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Lint, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm test
+
+      - run: npm run build
+
+      - run: npm pack
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: npm-tarball
+          path: '*.tgz'
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish to npm
+    needs: ci
+    if: |
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    concurrency:
+      group: publish-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: npm-tarball
+
+      - name: Extract package metadata from tarball
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=( *.tgz )
+          if [ ${#files[@]} -ne 1 ]; then
+            echo "::error::expected exactly 1 tarball, got ${#files[@]}"
+            exit 1
+          fi
+          tar -xzf "${files[0]}" package/package.json
+          NAME=$(node -p "require('./package/package.json').name")
+          VERSION=$(node -p "require('./package/package.json').version")
+          if [ -z "$NAME" ] || [ "$NAME" = "undefined" ] || [ -z "$VERSION" ] || [ "$VERSION" = "undefined" ]; then
+            echo "::error::Failed to read name/version from tarball's package.json"
+            exit 1
+          fi
+          echo "TARBALL=${files[0]}" >> "$GITHUB_ENV"
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          rm -rf package
+          echo "Tarball: ${files[0]} — $NAME@$VERSION"
+
+      - name: Verify version not already published
+        run: |
+          PUBLISHED=$(npm view "$NAME@$VERSION" version 2>/dev/null || true)
+          if [ -n "$PUBLISHED" ]; then
+            echo "::error::Version $VERSION of $NAME is already published to npm. Bump the version in package.json."
+            exit 1
+          fi
+          echo "Version $VERSION is not yet published. Proceeding."
+
+      - name: Publish to npm
+        run: npm publish "$TARBALL" --provenance --access public
